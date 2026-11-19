@@ -1,0 +1,297 @@
+-- Experimental community integration; not an official Q-SYS or Audinate plugin.
+-- Based on Patrick Gilligan's DanteDirectorAPI-Qsys (MIT; see repository LICENSE).
+PluginInfo = {
+  Name = "Dante~Director Routing Lab",
+  Version = "0.1.0.0", BuildVersion = "0.1.0.0",
+  Id = "aa8a1d49-c2ec-471c-a1c7-1b9a5662f1ab",
+  Author = "Community", Description = "Dante Director routing and selective presets"
+}
+function GetColor() return {31,95,110} end
+function GetPrettyName() return "Dante Director Routing Lab" end
+function GetProperties() return {} end
+function GetControls()
+  local c = {}
+  for _, n in ipairs({"APIKey","Domain","TXDevice","TXChannel","RXDevice","RXChannel","Feedback","Current","PresetName","PresetRoutes","RouteList"}) do
+    c[#c+1]={Name=n,ControlType="Text",Count=1,UserPin=false}
+  end
+  for _, n in ipairs({"Connect","Discover","Subscribe","Unsubscribe","AddRoute","AddClear","RemoveRoute","Recall"}) do
+    c[#c+1]={Name=n,ControlType="Button",ButtonType="Trigger",Count=1,UserPin=n=="Recall",PinStyle="Input"}
+  end
+  return c
+end
+function GetControlLayout()
+  local l,g={},{}
+  local function label(t,x,y,w)
+    g[#g+1]={Type="Text",Text=t,Position={x,y},Size={w,20},FontSize=12,HTextAlign="Left"}
+  end
+  local function field(n,t,x,y,w,s)
+    label(t,x,y,w)
+    l[n]={PrettyName=n,Style=s or "Text",Position={x,y+22},Size={w,28}}
+  end
+  local function button(n,t,x,y,w)
+    l[n]={PrettyName=n,Style="Button",ButtonStyle="Trigger",Legend=t,Position={x,y},Size={w,32}}
+  end
+  label("DIRECTOR ROUTING LAB   /   v0.1",16,8,610)
+  field("APIKey","API key (private design only)",16,34,430)
+  button("Connect","Connect",460,56,144)
+  field("Domain","Domain / site",16,94,430,"ComboBox")
+  button("Discover","Refresh devices",460,116,144)
+  field("TXDevice","Transmitter",16,158,280,"ComboBox")
+  field("RXDevice","Receiver",324,158,280,"ComboBox")
+  field("TXChannel","TX channel",16,220,280,"ComboBox")
+  field("RXChannel","RX channel",324,220,280,"ComboBox")
+  field("Current","Current RX subscription / status",16,282,588)
+  button("Subscribe","Subscribe",16,346,280)
+  button("Unsubscribe","Unsubscribe",324,346,280)
+  field("PresetName","Selective preset name",16,398,588)
+  button("AddRoute","Add subscription",16,458,188)
+  button("AddClear","Add unsubscribe",216,458,188)
+  button("RemoveRoute","Remove selected",416,458,188)
+  field("RouteList","Stored routes (select to remove)",16,502,588,"ComboBox")
+  button("Recall","Recall preset",16,564,588)
+  field("Feedback","Operation feedback",16,612,588)
+  -- PresetRoutes is intentionally not in layout: persistent design control holding JSON.
+  return l,g
+end
+
+if Controls then
+  local json=require("rapidjson")
+  local C=Controls
+  local domains,devices,tx,rx={},{},{},{}
+  local routes={}
+  local ready,busy=false,false
+  local domainId=nil
+  local function msg(s) C.Feedback.String=tostring(s) end
+  local function setChoices(c,items)
+    local names={}
+    for _,item in ipairs(items) do names[#names+1]=item.label end
+    c.Choices=names; c.String=""
+  end
+  local function selected(c,items)
+    for _,item in ipairs(items) do if item.label==c.String then return item.value end end
+  end
+  local function str(v) return type(v)=="string" and v or "" end
+  local function request(query,vars,done)
+    local key=C.APIKey.String
+    if key=="" then done(false,"API key required"); return end
+    local payload={query=query}
+    if vars then payload.variables=vars end
+    HttpClient.Upload({
+      Url="https://api.director.dante.cloud/graphql",Method="POST",Timeout=15,
+      Headers={["Content-Type"]="application/json",Authorization=key},
+      Data=json.encode(payload),
+      EventHandler=function(_,code,body)
+        if code~=200 then done(false,"HTTP "..tostring(code)); return end
+        local ok,result=pcall(json.decode,body or "")
+        if not ok or type(result)~="table" then done(false,"Invalid response"); return end
+        if result.errors then
+          local e=result.errors[1]
+          done(false,"GraphQL: "..(type(e)=="table" and str(e.message) or "error")); return
+        end
+        if type(result.data)~="table" then done(false,"No data"); return end
+        done(true,result.data)
+      end
+    })
+  end
+  local discovery=[[query Devices($domainId: ID!) { domain(id:$domainId) {
+    devices { id name txChannels { index name } rxChannels {
+      index name subscribedDevice subscribedChannel status
+    } }
+  } }]]
+  local mutation=[[mutation DeviceRxChannelsSubscriptionSet($input: DeviceRxChannelsSubscriptionSetInput!) {
+    DeviceRxChannelsSubscriptionSet(input:$input) { ok }
+  }]]
+  local function findDevice(id,list)
+    for _,d in ipairs(list) do if d.id==id then return d end end
+  end
+  local function findRX(d,index)
+    for _,ch in ipairs(d and d.rxChannels or {}) do if ch.index==index then return ch end end
+  end
+  local function channels(d,kind)
+    local a={}
+    for _,ch in ipairs(d and d[kind] or {}) do
+      if type(ch)=="table" and type(ch.index)=="number" then
+        a[#a+1]={label=tostring(ch.index).." | "..str(ch.name),value=ch}
+      end
+    end
+    return a
+  end
+  local function current()
+    local ch=selected(C.RXChannel,rx)
+    C.Current.String=ch and (str(ch.subscribedChannel).." @ "..str(ch.subscribedDevice).."   ["..str(ch.status).."]") or ""
+  end
+  local function resetDevices()
+    ready=false; devices={}; tx={}; rx={}
+    for _,n in ipairs({"TXDevice","RXDevice","TXChannel","RXChannel"}) do setChoices(C[n],{}) end
+    current()
+  end
+  local function deviceChoices(kind)
+    local a={}
+    for _,d in ipairs(devices) do
+      if type(d[kind])=="table" and #d[kind]>0 then
+        a[#a+1]={label=d.name.." ["..d.id.."]",value=d}
+      end
+    end
+    table.sort(a,function(a,b) return a.label<b.label end)
+    return a
+  end
+  local txDevices,rxDevices={},{}
+  local function updateDevices(list,preserve)
+    local td,rd,tc,rc=C.TXDevice.String,C.RXDevice.String,C.TXChannel.String,C.RXChannel.String
+    devices=list
+    txDevices=deviceChoices("txChannels"); rxDevices=deviceChoices("rxChannels")
+    setChoices(C.TXDevice,txDevices); setChoices(C.RXDevice,rxDevices)
+    if preserve then C.TXDevice.String=td; C.RXDevice.String=rd end
+    tx=channels(selected(C.TXDevice,txDevices),"txChannels"); rx=channels(selected(C.RXDevice,rxDevices),"rxChannels")
+    setChoices(C.TXChannel,tx); setChoices(C.RXChannel,rx)
+    if preserve then C.TXChannel.String=tc; C.RXChannel.String=rc end
+    current()
+  end
+  local function loadDevices(id,done)
+    request(discovery,{domainId=id},function(ok,data)
+      if not ok then done(false,data); return end
+      if type(data.domain)~="table" or type(data.domain.devices)~="table" then done(false,"No device list"); return end
+      done(true,data.domain.devices)
+    end)
+  end
+  local function guard()
+    if busy then msg("Operation busy"); return false end
+    return true
+  end
+  C.Connect.EventHandler=function()
+    if not guard() then return end
+    busy=true; resetDevices(); domains={}; domainId=nil; setChoices(C.Domain,{})
+    msg("Connecting...")
+    request("query { domains { id name } }",nil,function(ok,data)
+      busy=false
+      if not ok then msg(data); return end
+      for _,d in ipairs(data.domains or {}) do
+        domains[#domains+1]={label=d.name.." ["..d.id.."]",value=d.id}
+      end
+      setChoices(C.Domain,domains); msg("Connected. Select domain and refresh devices.")
+    end)
+  end
+  C.APIKey.EventHandler=function()
+    if busy then msg("Key changed during request; reconnect before routing") end
+    ready=false; domainId=nil; domains={}; setChoices(C.Domain,{})
+    resetDevices()
+  end
+  C.Domain.EventHandler=function() resetDevices(); domainId=nil; msg("Refresh devices for selected domain") end
+  C.Discover.EventHandler=function()
+    if not guard() then return end
+    local id=selected(C.Domain,domains)
+    if not id then msg("Select a domain first"); return end
+    local key=C.APIKey.String
+    busy=true; resetDevices(); msg("Discovering...")
+    loadDevices(id,function(ok,list)
+      busy=false
+      if not ok then msg(list); return end
+      if selected(C.Domain,domains)~=id or C.APIKey.String~=key then msg("Selection changed; refresh again"); return end
+      domainId=id; updateDevices(list,false); ready=true; msg(#devices.." devices discovered")
+    end)
+  end
+  C.TXDevice.EventHandler=function()
+    tx=channels(selected(C.TXDevice,txDevices),"txChannels"); setChoices(C.TXChannel,tx)
+  end
+  C.RXDevice.EventHandler=function()
+    rx=channels(selected(C.RXDevice,rxDevices),"rxChannels"); setChoices(C.RXChannel,rx); current()
+  end
+  C.RXChannel.EventHandler=current
+  local function route(clear)
+    if not ready or domainId~=selected(C.Domain,domains) then msg("Refresh devices first"); return end
+    local rd,rc=selected(C.RXDevice,rxDevices),selected(C.RXChannel,rx)
+    if not rd or not rc then msg("Select receiver and RX channel"); return end
+    local td,tc=selected(C.TXDevice,txDevices),selected(C.TXChannel,tx)
+    if not clear and (not td or not tc or str(tc.name)=="") then msg("Select transmitter and TX channel"); return end
+    return {domainId=domainId,deviceId=rd.id,receiver=rd.name,rxChannelIndex=rc.index,
+      subscribedDevice=clear and "" or td.name,subscribedChannel=clear and "" or tc.name}
+  end
+  local function apply(list)
+    if not guard() then return end
+    if not ready or not domainId or domainId~=selected(C.Domain,domains) or #list==0 then msg("Refresh devices / add routes first"); return end
+    local id,key=domainId,C.APIKey.String
+    local groups,order={},{}
+    for _,r in ipairs(list) do
+      if r.domainId~=id or not findRX(findDevice(r.deviceId,devices),r.rxChannelIndex) then
+        msg("Preset contains an unavailable receiver or another domain"); return
+      end
+      if r.subscribedDevice~="" then
+        local found=false
+        for _,d in ipairs(devices) do
+          if d.name==r.subscribedDevice then
+            for _,ch in ipairs(d.txChannels or {}) do if ch.name==r.subscribedChannel then found=true end end
+          end
+        end
+        if not found then msg("Transmitter not found; refresh and check preset"); return end
+      end
+      if not groups[r.deviceId] then groups[r.deviceId]={}; order[#order+1]=r.deviceId end
+      groups[r.deviceId][#groups[r.deviceId]+1]={rxChannelIndex=r.rxChannelIndex,subscribedDevice=r.subscribedDevice,subscribedChannel=r.subscribedChannel}
+    end
+    busy=true; local failures=0
+    local function valid() return C.APIKey.String==key and domainId==id and selected(C.Domain,domains)==id end
+    local function finish()
+      msg("Submitted; verifying receiver status...")
+      Timer.CallAfter(function()
+        if not valid() then busy=false; msg("Selection changed; refresh routing"); return end
+        loadDevices(id,function(ok,data)
+          busy=false
+          if not ok or not valid() then msg("Verification unavailable: "..(ok and "selection changed" or data)); return end
+          updateDevices(data,true)
+          local matches,active=0,0
+          for _,r in ipairs(list) do
+            local ch=findRX(findDevice(r.deviceId,data),r.rxChannelIndex)
+            if ch and str(ch.subscribedDevice)==r.subscribedDevice and str(ch.subscribedChannel)==r.subscribedChannel then
+              matches=matches+1
+              if (r.subscribedDevice=="" and ch.status=="NONE") or ch.status=="DYNAMIC" or ch.status=="STATIC" or ch.status=="SUBSCRIBE_SELF" then active=active+1 end
+            end
+          end
+          msg(string.format("%d/%d match; %d settled; %d failed requests. Refresh for later status.",matches,#list,active,failures))
+        end)
+      end,2)
+    end
+    local function send(i)
+      if not valid() then busy=false; msg("Selection changed; remaining writes aborted"); return end
+      local dev=order[i]
+      if not dev then finish(); return end
+      request(mutation,{input={deviceId=dev,subscriptions=groups[dev]}},function(ok,data)
+        if not ok or type(data.DeviceRxChannelsSubscriptionSet)~="table" or not data.DeviceRxChannelsSubscriptionSet.ok then failures=failures+1 end
+        send(i+1)
+      end)
+    end
+    msg("Applying "..#list.." routes...")
+    send(1)
+  end
+  local function refreshRoutes()
+    local labels={}
+    for i,r in ipairs(routes) do labels[i]=i..": "..(r.subscribedDevice=="" and "CLEAR" or r.subscribedChannel.." @ "..r.subscribedDevice).." -> "..r.receiver..":"..r.rxChannelIndex end
+    C.RouteList.Choices=labels; C.RouteList.String=""
+    C.PresetRoutes.String=json.encode(routes)
+    C.Recall.Legend=C.PresetName.String~="" and ("Recall: "..C.PresetName.String) or "Recall preset"
+  end
+  local function add(clear)
+    if not guard() then return end
+    local r=route(clear); if not r then return end
+    for i,old in ipairs(routes) do
+      if old.domainId==r.domainId and old.deviceId==r.deviceId and old.rxChannelIndex==r.rxChannelIndex then table.remove(routes,i); break end
+    end
+    routes[#routes+1]=r; refreshRoutes(); msg(#routes.." routes stored (not applied)")
+  end
+  C.Subscribe.EventHandler=function() if guard() then local r=route(false); if r then apply({r}) end end end
+  C.Unsubscribe.EventHandler=function() if guard() then local r=route(true); if r then apply({r}) end end end
+  C.AddRoute.EventHandler=function() add(false) end
+  C.AddClear.EventHandler=function() add(true) end
+  C.RemoveRoute.EventHandler=function()
+    if not guard() then return end
+    local i=tonumber(C.RouteList.String:match("^(%d+):"))
+    if i and routes[i] then table.remove(routes,i); refreshRoutes(); msg("Route removed") end
+  end
+  C.PresetName.EventHandler=refreshRoutes
+  C.Recall.EventHandler=function() apply(routes) end
+  local ok,stored=pcall(json.decode,C.PresetRoutes.String or "")
+  if ok and type(stored)=="table" then
+    for _,r in ipairs(stored) do
+      if type(r)=="table" and type(r.domainId)=="string" and type(r.deviceId)=="string" and type(r.receiver)=="string" and type(r.rxChannelIndex)=="number" and type(r.subscribedDevice)=="string" and type(r.subscribedChannel)=="string" then routes[#routes+1]=r end
+    end
+  end
+  refreshRoutes(); msg("Enter API key and Connect. No routing is applied automatically.")
+end
